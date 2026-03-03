@@ -3,7 +3,18 @@ import { spawn, ChildProcess, exec } from 'child_process'
 import * as fs from 'fs'
 import { TextDecoder } from 'util'
 
-export const name = 'mc-manager'
+export const name = 'local-mcs-runner'
+
+// 指令配置接口
+export interface CommandConfig {
+  setServer: string
+  startServer: string
+  stopServer: string
+  sudo: string
+  say: string
+  list: string
+  killServer: string
+}
 
 // 网页控制台配置项
 export interface Config {
@@ -12,7 +23,19 @@ export interface Config {
   allowedGroups: string[]
   adminIds: string[]
   encoding: 'utf-8' | 'gbk'
+  commands: CommandConfig
 }
+
+// 指令配置 Schema
+const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
+  setServer: Schema.string().default('setServer').description('切换服务器指令'),
+  startServer: Schema.string().default('开服').description('启动服务器指令'),
+  stopServer: Schema.string().default('关服').description('关闭服务器指令'),
+  sudo: Schema.string().default('sudo').description('发送控制台命令指令'),
+  say: Schema.string().default('say').description('发送消息指令'),
+  list: Schema.string().default('list').description('查询在线玩家指令'),
+  killServer: Schema.string().default('杀死服务器进程').description('强制终止服务器指令'),
+}).description('指令触发消息配置')
 
 export const Config: Schema<Config> = Schema.object({
   serverPaths: Schema.dict(String).role('table').description('服务端名称与目录（绝对路径）').required(),
@@ -20,10 +43,12 @@ export const Config: Schema<Config> = Schema.object({
   allowedGroups: Schema.array(String).description('允许控制的群组').required(),
   adminIds: Schema.array(String).description('允许控制的用户账号').required(),
   encoding: Schema.union(['utf-8', 'gbk']).description('服务端日志编码'),
-})
+  commands: CommandConfigSchema,
+}).description('注意：重载配置会导致服务器进程 PID 丢失，重载配置前，请先停止服务器进程！')
 
 // 延时函数
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
 export function apply(ctx: Context, config: Config) {
   // 此处变量存在于插件生命周期内，用于持有服务端进程
   let mcProcess: ChildProcess | null = null
@@ -33,6 +58,13 @@ export function apply(ctx: Context, config: Config) {
 
   const logger = ctx.logger('MC-Server')
   const decoder = new TextDecoder(config.encoding)
+
+  // 获取指令名称（处理带参数的指令）
+  const getCommandName = (cmd: string) => {
+    const parts = cmd.split(' ')
+    return parts[0]
+  }
+
   // 日志清洗工具
   const cleanLog = (log: string): string | null => {
     // 匹配标准控制台输出格式
@@ -49,10 +81,7 @@ export function apply(ctx: Context, config: Config) {
     const chatRegex = /]:\s*<([^>]+)>\s*(.*)$/
     const match = log.match(chatRegex)
     if (match) {
-      return {
-        player: match[1],
-        message: match[2]
-      }
+      return { player: match[1], message: match[2] }
     }
     return null
   }
@@ -78,21 +107,20 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // 指令：指定服务端
-  ctx.command('setServer <name:string>', '指定当前操作的服务端')
+  ctx.command(`${config.commands.setServer} <name:string>`, '指定当前操作的服务端')
     .action(async ({ session }, name) => {
       // 权限检查
-      if (!checkPermission(session))
-        return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      if (mcProcess)
-        return '服务器开着呢，你切牛魔'
+      if (mcProcess) return '服务器开着呢，不能热插拔啦~'
 
       // 检查服务端名称
       if (!Object.keys(config.serverPaths).includes(name) || !name) {
         const available = Object.keys(config.serverPaths).join(' | ')
         return '爬！服务器列表里只有\n' + available
       }
+
       const targetPath = config.serverPaths[name]
       try {
         if (!targetPath || !fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
@@ -101,16 +129,16 @@ export function apply(ctx: Context, config: Config) {
       } catch (e) {
         return `服务器路径"${targetPath}"不可用！`
       }
+
       currentServerName = name
       return '当前服务器已切换为 ' + name + '\n' + targetPath
     })
 
   // 指令：开启服务器
-  ctx.command('所长开服', '启动MC服务器')
+  ctx.command(config.commands.startServer, '启动MC服务器')
     .action(async ({ session }) => {
       // 权限检查
-      if (!checkPermission(session))
-        return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
       if (mcProcess) {
@@ -124,12 +152,13 @@ export function apply(ctx: Context, config: Config) {
 
       const targetPath = config.serverPaths[currentServerName]
       session.send(`正在启动${currentServerName}，请等待1~2分钟……`)
+
       try {
         // spawn 允许保持与子进程的连接
         mcProcess = spawn(config.batName, [], {
-          cwd: targetPath,                        // 设置工作目录
-          shell: true,                            // 允许运行bat脚本
-          stdio: 'pipe'                           // 启用输入输出流
+          cwd: targetPath, // 设置工作目录
+          shell: true, // 允许运行bat脚本
+          stdio: 'pipe' // 启用输入输出流
         })
 
         logger.info(`服务器已启动 (PID: ${mcProcess.pid})`)
@@ -138,6 +167,7 @@ export function apply(ctx: Context, config: Config) {
         mcProcess.stdout?.on('data', (data) => {
           const chunk = decoder.decode(data, { stream: true }).trim()
           const lines = chunk.split('\n')
+
           for (const line of lines) {
             const rawLog = line.trim()
             if (!rawLog) continue
@@ -181,11 +211,10 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // 指令：关闭服务器
-  ctx.command('所长关服', '关闭MC服务器')
+  ctx.command(config.commands.stopServer, '关闭MC服务器')
     .action(async ({ session }) => {
       // 权限校验
-      if (!checkPermission(session))
-        return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
       if (!mcProcess) {
@@ -193,10 +222,13 @@ export function apply(ctx: Context, config: Config) {
       }
 
       const currentPid = mcProcess.pid
+
       try {
         mcProcess.stdin?.write('stop\n')
-        session.send('stop指令发过去了，关不关的掉听天由命吧~')
+        session.send('stop指令发送喽~')
+
         await sleep(10000)
+
         if (mcProcess) {
           session.send('stop无法正常关闭，强制处决中......')
           exec(`taskkill /pid ${currentPid} /T /F`, (error, stdout, stderr) => {
@@ -208,6 +240,7 @@ export function apply(ctx: Context, config: Config) {
             }
           })
         }
+
         return
       } catch (e) {
         logger.error(e)
@@ -216,11 +249,10 @@ export function apply(ctx: Context, config: Config) {
     })
 
   // 指令：向服务器发送命令
-  ctx.command('sudo <command:text>', '向服务器发送控制台命令')
+  ctx.command(`${config.commands.sudo} <command:text>`, '向服务器发送控制台命令')
     .action(async ({ session }, command) => {
       // 权限校验
-      if (!checkPermission(session))
-        return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
       if (!mcProcess) {
@@ -233,37 +265,40 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        isCapturing = true                        // 开始捕获输出
+        isCapturing = true // 开始捕获输出
         captureBuffer = []
+
         mcProcess.stdin?.write(command + '\n')
+
         await sleep(1000)
-        isCapturing = false                       // 停止捕获输出   
+
+        isCapturing = false // 停止捕获输出
+
         if (captureBuffer.length === 0) {
           return '命令已发送，无输出'
         }
+
         const output = captureBuffer.join('\n')
         return output.length > 300 ? output.substring(0, 300) + '\n...（消息过长，已截断）' : output
+
       } catch (e) {
-        isCapturing = false                       // 停止捕获输出
+        isCapturing = false // 停止捕获输出
         logger.error(e)
         return '命令发送失败: ' + e.message
       }
     })
 
   // 指令：向服务器发送信息
-  ctx.command('say <content:text>', '向服务器发送信息')
+  ctx.command(`${config.commands.say} <content:text>`, '向服务器发送信息')
     .action(async ({ session }, content) => {
       // 权限校验
-      if (!checkPermission(session))
-        return '你没有发送信息的权限！'
+      if (!checkPermission(session)) return '你没有发送信息的权限！'
 
       // 状态检查
-      if (!mcProcess)
-        return '服务器都没开，你说你🐎呢'
+      if (!mcProcess) return '服务器都没开，你say你🐎呢'
 
       // 内容检查
-      if (!content)
-        return '你说你🐎呢'
+      if (!content) return '你say你🐎呢'
 
       try {
         const senderName = session.username || session.userId
@@ -275,12 +310,44 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  // 指令：强制杀死服务器进程
-  ctx.command('所长，把服杀了', '强制杀死服务器进程')
+  // 指令：查询在线玩家
+  ctx.command(config.commands.list, '查询服务器在线玩家')
     .action(async ({ session }) => {
       // 权限校验
-      if (!checkPermission(session))
-        return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+
+      // 状态检查
+      if (!mcProcess) return '服务器都没开，你list你🐎呢'
+
+      try {
+        isCapturing = true
+        captureBuffer = []
+
+        mcProcess.stdin?.write('list\n')
+
+        await sleep(2000)
+
+        isCapturing = false
+
+        if (captureBuffer.length === 0) {
+          return '命令已发送，但无输出'
+        }
+
+        const output = captureBuffer.join('\n')
+        return output.length > 500 ? output.substring(0, 500) + '\n...（消息过长）' : output
+
+      } catch (e) {
+        isCapturing = false
+        logger.error(e)
+        return '查询失败: ' + e.message
+      }
+    })
+
+  // 指令：强制杀死服务器进程
+  ctx.command(config.commands.killServer, '强制杀死服务器进程')
+    .action(async ({ session }) => {
+      // 权限校验
+      if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
       if (!mcProcess || mcProcess.killed) {
@@ -288,6 +355,7 @@ export function apply(ctx: Context, config: Config) {
       }
 
       const currentPid = mcProcess.pid
+
       try {
         exec(`taskkill /pid ${currentPid} /T /F`, (error, stdout, stderr) => {
           if (error) {
@@ -301,7 +369,7 @@ export function apply(ctx: Context, config: Config) {
         return
       } catch (e) {
         logger.error(e)
-        return '纳尼，居然杀不掉？'
+        return `处决失败！系统返回错误：${e.message}`
       }
     })
 }

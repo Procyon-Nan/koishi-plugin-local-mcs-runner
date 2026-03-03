@@ -1,9 +1,9 @@
 {
-  "name": "koishi-plugin-mc-manager",
+  "name": "koishi-plugin-local-mcs-runner",
   "koishi": {
     "description": {
-      "en": "A easy plugin to start up local minecraft server.",
-      "zh": "一个用于启动本地minecraft服务器的简单插件"
+      "en": "A plugin to manage local Minecraft server through chatbot commands.",
+      "zh": "通过聊天机器人指令管理本地Minecraft服务器的插件"
     }
   },
   "version": "1.0.6",
@@ -18,7 +18,8 @@
     "chatbot",
     "koishi",
     "plugin",
-    "minecraft"
+    "minecraft",
+    "local-server"
   ],
   "peerDependencies": {
     "koishi": "^4.18.7"
@@ -28,6 +29,6 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Procyon-Nan/koishi-plugin-mc-manager.git"
+    "url": "git+https://github.com/Procyon-Nan/koishi-plugin-local-mcs-runner.git"
   }
 }
