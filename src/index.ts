@@ -26,6 +26,7 @@ export interface Config {
   encoding: 'utf-8' | 'gbk'
   injectMcChatToKoishi: boolean
   injectTargetGroup: string
+  llmPrefix: string
   commands: CommandConfig
 }
 
@@ -49,6 +50,7 @@ export const Config: Schema<Config> = Schema.object({
   encoding: Schema.union(['utf-8', 'gbk']).default('utf-8').description('服务端日志编码'),
   injectMcChatToKoishi: Schema.boolean().default(false).description('将MC玩家聊天注入到Koishi消息处理链'),
   injectTargetGroup: Schema.string().default('').description('注入目标群组ID（留空则使用allowedGroups）'),
+  llmPrefix: Schema.string().default('执行/').description('LLM触发前缀（匹配到后将其后内容发送到服务端控制台）'),
   commands: CommandConfigSchema.required(),
 }).description('注意：重载配置会导致服务器进程 PID 丢失，重载配置前，请先停止服务器进程！')
 
@@ -64,6 +66,39 @@ export function apply(ctx: Context, config: Config) {
 
   const logger = ctx.logger('MC-Server')
   const decoder = new TextDecoder(config.encoding)
+
+  const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  // 监听 Bot 出站消息，提取 LLM 触发的控制台指令
+  ctx.on('before-send', async (session: any) => {
+    if (!mcProcess || !config.llmPrefix) return
+
+    const content = session?.content
+    if (!content || typeof content !== 'string') return
+
+    // 跳过本插件的 MC 转发文本，避免误触发
+    if (content.startsWith('[MC] ')) return
+
+    const targetGroupId = session.guildId || session.channelId
+    if (config.allowedGroups.length > 0 && targetGroupId && !config.allowedGroups.includes(targetGroupId)) {
+      return
+    }
+
+    const escapedPrefix = escapeRegExp(config.llmPrefix)
+    const regex = new RegExp(`(?:^|\\n)\\s*${escapedPrefix}([^\\n]+)`)
+    const match = content.match(regex)
+    if (!match || !match[1]) return
+
+    const command = match[1].replace(/^\/+/, '').trim()
+    if (!command) return
+
+    logger.info(`拦截到LLM触发的控制台指令: ${command}`)
+    try {
+      mcProcess.stdin?.write(command + '\n')
+    } catch (e) {
+      logger.error(`LLM触发指令执行失败: ${e.message}`)
+    }
+  })
 
   // 杀死服务器进程
   const killProcessByRuntime = (pid: number, force = true, callback?: (error?: Error) => void) => {

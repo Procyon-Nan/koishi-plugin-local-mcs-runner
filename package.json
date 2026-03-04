@@ -6,7 +6,7 @@
       "zh": "通过聊天机器人指令管理本地Minecraft服务器的插件"
     }
   },
-  "version": "1.0.6",
+  "version": "1.0.9",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
