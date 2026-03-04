@@ -22,13 +22,14 @@ export interface Config {
   batName: string
   allowedGroups: string[]
   adminIds: string[]
+  runtime: 'windows' | 'linux'
   encoding: 'utf-8' | 'gbk'
   commands: CommandConfig
 }
 
 // 指令配置 Schema
 const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
-  setServer: Schema.string().default('setServer').description('切换服务器指令'),
+  setServer: Schema.string().default('setserver').description('切换服务器指令'),
   startServer: Schema.string().default('开服').description('启动服务器指令'),
   stopServer: Schema.string().default('关服').description('关闭服务器指令'),
   sudo: Schema.string().default('sudo').description('发送控制台命令指令'),
@@ -38,12 +39,13 @@ const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
 }).description('指令触发消息配置')
 
 export const Config: Schema<Config> = Schema.object({
+  runtime: Schema.union(['windows', 'linux']).default('windows').description('运行环境'),
   serverPaths: Schema.dict(String).role('table').description('服务端名称与目录（绝对路径）').required(),
-  batName: Schema.string().default('run.bat').description('启动脚本名称'),
-  allowedGroups: Schema.array(String).description('允许控制的群组').required(),
+  batName: Schema.string().description('启动脚本名称').required(),
+  allowedGroups: Schema.array(String).default([]).description('允许控制的群组'),
   adminIds: Schema.array(String).description('允许控制的用户账号').required(),
-  encoding: Schema.union(['utf-8', 'gbk']).description('服务端日志编码'),
-  commands: CommandConfigSchema,
+  encoding: Schema.union(['utf-8', 'gbk']).default('utf-8').description('服务端日志编码'),
+  commands: CommandConfigSchema.required(),
 }).description('注意：重载配置会导致服务器进程 PID 丢失，重载配置前，请先停止服务器进程！')
 
 // 延时函数
@@ -59,10 +61,33 @@ export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('MC-Server')
   const decoder = new TextDecoder(config.encoding)
 
-  // 获取指令名称（处理带参数的指令）
-  const getCommandName = (cmd: string) => {
-    const parts = cmd.split(' ')
-    return parts[0]
+  // 杀死服务器进程
+  const killProcessByRuntime = (pid: number, force = true, callback?: (error?: Error) => void) => {
+    const cmd = config.runtime === 'linux'
+      ? `kill ${force ? '-KILL' : '-TERM'} ${pid}`
+      : `taskkill /pid ${pid} /T /F`
+
+    exec(cmd, (error) => {
+      if (callback) callback(error || undefined)
+    })
+  }
+
+  // 按运行环境启动服务器进程
+  const startProcessByRuntime = (targetPath: string) => {
+    if (config.runtime === 'linux') {
+      const linuxScript = config.batName.startsWith('./') ? config.batName : `./${config.batName}`
+      return spawn(linuxScript, [], {
+        cwd: targetPath,
+        shell: true,
+        stdio: 'pipe'
+      })
+    }
+
+    return spawn(config.batName, [], {
+      cwd: targetPath,
+      shell: true,
+      stdio: 'pipe'
+    })
   }
 
   // 日志清洗工具
@@ -154,12 +179,8 @@ export function apply(ctx: Context, config: Config) {
       session.send(`正在启动${currentServerName}，请等待1~2分钟……`)
 
       try {
-        // spawn 允许保持与子进程的连接
-        mcProcess = spawn(config.batName, [], {
-          cwd: targetPath, // 设置工作目录
-          shell: true, // 允许运行bat脚本
-          stdio: 'pipe' // 启用输入输出流
-        })
+        // 按运行环境启动并保持与子进程连接
+        mcProcess = startProcessByRuntime(targetPath)
 
         logger.info(`服务器已启动 (PID: ${mcProcess.pid})`)
 
@@ -231,12 +252,12 @@ export function apply(ctx: Context, config: Config) {
 
         if (mcProcess) {
           session.send('stop无法正常关闭，强制处决中......')
-          exec(`taskkill /pid ${currentPid} /T /F`, (error, stdout, stderr) => {
+          killProcessByRuntime(currentPid, true, (error) => {
             if (error) {
               logger.error(`杀死服务端进程失败: ${error.message}`)
               session.send(`处决失败！系统返回错误：${error.message}`)
             } else {
-              logger.info('已执行 taskkill，等待进程树清理……')
+              logger.info(`已执行 ${config.runtime} 进程终止命令，等待进程清理……`)
             }
           })
         }
@@ -357,13 +378,13 @@ export function apply(ctx: Context, config: Config) {
       const currentPid = mcProcess.pid
 
       try {
-        exec(`taskkill /pid ${currentPid} /T /F`, (error, stdout, stderr) => {
+        killProcessByRuntime(currentPid, true, (error) => {
           if (error) {
             logger.error(`杀死服务端进程失败: ${error.message}`)
             session.send(`处决失败！系统返回错误：${error.message}`)
           } else {
-            logger.info('已执行 taskkill，等待进程树清理……')
-            session.send('处决成功！正在清理进程树。')
+            logger.info(`已执行 ${config.runtime} 进程终止命令，等待进程树清理……`)
+            session.send('处决成功！已清理进程~')
           }
         })
         return
