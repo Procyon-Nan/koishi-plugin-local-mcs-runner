@@ -76,28 +76,45 @@ export function apply(ctx: Context, config: Config) {
     if (!mcProcess || !config.llmPrefix) return
 
     const targetGroupId = session.guildId || session.channelId
+    const userId = session.userId
+    const content = session?.content
+
+    logger.info(`[LLM-HOOK] recv user=${userId} guild=${session.guildId} channel=${session.channelId} content=${content}`)
+
     if (config.allowedGroups.length > 0 && targetGroupId && !config.allowedGroups.includes(targetGroupId)) {
+      logger.info(`[LLM-HOOK] blocked by allowedGroups, target=${targetGroupId}`)
       return
     }
 
-    const userId = session.userId
     const isAllowedUser = config.llmBotIds.includes(userId) || config.adminIds.includes(userId)
-    if (!isAllowedUser) return
+    if (!isAllowedUser) {
+      logger.info(`[LLM-HOOK] blocked by identity, user=${userId}`)
+      return
+    }
 
-    const content = session?.content
-    if (!content || typeof content !== 'string') return
+    if (!content || typeof content !== 'string') {
+      logger.info('[LLM-HOOK] blocked by empty content')
+      return
+    }
 
     const escapedPrefix = escapeRegExp(config.llmPrefix)
-    const regex = new RegExp(`(?:^|\\n)\\s*${escapedPrefix}([^\\n]+)`)
+    const regex = new RegExp(`${escapedPrefix}\\s*([^\\n]+)`)
     const match = content.match(regex)
-    if (!match || !match[1]) return
+    if (!match || !match[1]) {
+      logger.info(`[LLM-HOOK] prefix not matched, prefix=${config.llmPrefix}`)
+      return
+    }
 
     const command = match[1].replace(/^\/+/, '').trim()
-    if (!command) return
+    if (!command) {
+      logger.info('[LLM-HOOK] matched but command empty')
+      return
+    }
 
     logger.info(`收到来自 ${userId} 的控制台指令: ${command}`)
     try {
       mcProcess.stdin?.write(command + '\n')
+      logger.info(`[LLM-HOOK] command sent: ${command}`)
     } catch (e) {
       logger.error(`指令执行失败: ${e.message}`)
     }
