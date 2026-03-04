@@ -27,6 +27,7 @@ export interface Config {
   injectMcChatToKoishi: boolean
   injectTargetGroup: string
   llmPrefix: string
+  llmBotIds: string[]
   commands: CommandConfig
 }
 
@@ -51,6 +52,7 @@ export const Config: Schema<Config> = Schema.object({
   injectMcChatToKoishi: Schema.boolean().default(false).description('将MC玩家聊天注入到Koishi消息处理链'),
   injectTargetGroup: Schema.string().default('').description('注入目标群组ID（留空则使用allowedGroups）'),
   llmPrefix: Schema.string().default('执行/').description('LLM触发前缀（匹配到后将其后内容发送到服务端控制台）'),
+  llmBotIds: Schema.array(String).default([]).description('允许触发后台指令的云端机器人账号ID'),
   commands: CommandConfigSchema.required(),
 }).description('注意：重载配置会导致服务器进程 PID 丢失，重载配置前，请先停止服务器进程！')
 
@@ -69,20 +71,21 @@ export function apply(ctx: Context, config: Config) {
 
   const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-  // 监听 Bot 出站消息，提取 LLM 触发的控制台指令
-  ctx.on('before-send', async (session: any) => {
+  // 监听群消息，提取云端LLM触发的控制台指令（适用于分布式部署）
+  ctx.on('message', async (session: any) => {
     if (!mcProcess || !config.llmPrefix) return
-
-    const content = session?.content
-    if (!content || typeof content !== 'string') return
-
-    // 跳过本插件的 MC 转发文本，避免误触发
-    if (content.startsWith('[MC] ')) return
 
     const targetGroupId = session.guildId || session.channelId
     if (config.allowedGroups.length > 0 && targetGroupId && !config.allowedGroups.includes(targetGroupId)) {
       return
     }
+
+    const userId = session.userId
+    const isAllowedUser = config.llmBotIds.includes(userId) || config.adminIds.includes(userId)
+    if (!isAllowedUser) return
+
+    const content = session?.content
+    if (!content || typeof content !== 'string') return
 
     const escapedPrefix = escapeRegExp(config.llmPrefix)
     const regex = new RegExp(`(?:^|\\n)\\s*${escapedPrefix}([^\\n]+)`)
@@ -92,11 +95,11 @@ export function apply(ctx: Context, config: Config) {
     const command = match[1].replace(/^\/+/, '').trim()
     if (!command) return
 
-    logger.info(`拦截到LLM触发的控制台指令: ${command}`)
+    logger.info(`收到来自 ${userId} 的控制台指令: ${command}`)
     try {
       mcProcess.stdin?.write(command + '\n')
     } catch (e) {
-      logger.error(`LLM触发指令执行失败: ${e.message}`)
+      logger.error(`指令执行失败: ${e.message}`)
     }
   })
 
