@@ -17,4 +17,3 @@
 - 新增“MC玩家聊天注入 Koishi 消息处理链”能力（可通过配置开关启用）。
 - 新增注入目标群配置项（留空时回落使用 `allowedGroups`）。
 - 修复 onebot 场景下注入消息时的 `missing primary key` 问题，补齐会话关键字段并调整虚拟用户 ID 生成策略。
-- 备份原始入口文件为 `src/index.ts.bak`。
