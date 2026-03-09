@@ -1,6 +1,6 @@
 import { Schema } from 'koishi'
 
-// 指令配置：定义各条 Koishi 指令的触发词。
+// 定义各条 Koishi 指令的触发词
 export interface CommandConfig {
   setServer: string
   startServer: string
@@ -11,14 +11,14 @@ export interface CommandConfig {
   killServer: string
 }
 
-// 广播配置：发送到所有允许群聊的广播文案。
+// 发送到所有目标群聊的广播消息
 export interface BroadcastConfig {
   mcChat: string
   stopByUser: string
   stopUnexpectedly: string
 }
 
-// 通用返回文案：跨多个命令复用的提示内容。
+// 多个命令复用的通用返回消息
 export interface CommonResponseConfig {
   noControlPermission: string
   pathUnavailable: string
@@ -26,14 +26,14 @@ export interface CommonResponseConfig {
   killFailed: string
 }
 
-// 切换服务端命令的返回文案。
+// 切换服务端命令的返回消息
 export interface SetServerResponseConfig {
   runningBlocked: string
   invalidName: string
   success: string
 }
 
-// 开服命令的返回文案。
+// 开服命令的返回消息
 export interface StartServerResponseConfig {
   alreadyRunning: string
   starting: string
@@ -42,39 +42,39 @@ export interface StartServerResponseConfig {
   startAccepted: string
 }
 
-// 关服命令的返回文案。
+// 关服命令的返回消息
 export interface StopServerResponseConfig {
   stopCommandSent: string
   forceKilling: string
   stopFailed: string
 }
 
-// sudo 命令的返回文案。
+// sudo 命令的返回消息
 export interface SudoResponseConfig {
   emptyCommand: string
   noOutput: string
   sendFailed: string
 }
 
-// say 命令的返回文案。
+// say 命令的返回消息
 export interface SayResponseConfig {
   noPermission: string
   emptyContent: string
   sendFailed: string
 }
 
-// list 命令的返回文案。
+// list 命令的返回消息
 export interface ListResponseConfig {
   noOutput: string
   queryFailed: string
 }
 
-// 强制终止命令的返回文案。
+// 强制终止命令的返回消息
 export interface KillServerResponseConfig {
   killSuccess: string
 }
 
-// 返回文案总配置：common 用于复用，其余按命令拆分
+// 返回消息总配置：common 用于复用，其余按命令拆分
 export interface ResponseConfig {
   common: CommonResponseConfig
   setServer: SetServerResponseConfig
@@ -86,7 +86,7 @@ export interface ResponseConfig {
   killServer: KillServerResponseConfig
 }
 
-// 插件主配置：包含服务端路径、权限、广播文案、命令回复文案和指令触发词。
+// 插件主配置：包含服务端路径、权限、广播文案、命令回复消息和指令触发词。
 export interface Config {
   serverPaths: Record<string, string>
   batName: string
@@ -121,7 +121,7 @@ const BroadcastConfigSchema: Schema<BroadcastConfig> = Schema.object({
   stopUnexpectedly: Schema.string().default('哎......服务器怎么寄了~').description('服务端非预期退出时的群聊广播'),
 }).description('广播到所有群聊的消息配置')
 
-// 指令返回信息 Schema
+// 指令返回消息 Schema
 const ResponseConfigSchema: Schema<ResponseConfig> = Schema.object({
   common: Schema.object({
     noControlPermission: Schema.string().default('你没有控制服务器的权限！').description('无控制权限时的提示'),
@@ -180,6 +180,6 @@ export const Config: Schema<Config> = Schema.object({
   commands: CommandConfigSchema.required(),
   tipsTittle: Schema.object({}).description('消息配置可用的模板变量'),
   tipsMessage: Schema.object({}).description('{player} {message} {available} {name} {path} {serverName} {pid} {error}'),
-  broadcasts: BroadcastConfigSchema.required(),
-  responses: ResponseConfigSchema.required(),
+  broadcasts: BroadcastConfigSchema,
+  responses: ResponseConfigSchema,
 }).description('注意：建议启动脚本保持前台运行，不要在脚本内自行脱离控制台。')
