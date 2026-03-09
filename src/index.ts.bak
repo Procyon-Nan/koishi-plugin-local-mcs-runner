@@ -5,39 +5,6 @@ import { TextDecoder } from 'util'
 
 export const name = 'local-mcs-runner'
 
-// 运行时状态提升到全局，用于在 Koishi 热重载插件时保留对子进程的控制句柄。
-type RuntimeStatus = 'stopped' | 'starting' | 'running' | 'stopping'
-
-interface PluginRuntime {
-  child: ChildProcess | null
-  status: RuntimeStatus
-  currentServerName: string
-  expectedExit: boolean
-  isCapturing: boolean
-  captureBuffer: string[]
-  cleanupListeners: (() => void) | null
-}
-
-const runtimeKey = Symbol.for('koishi-plugin-local-mcs-runner.runtime')
-
-// 初始化全局共享运行时；仅在当前 Node 进程首次加载插件时创建一次。
-const createRuntime = (): PluginRuntime => ({
-  child: null,
-  status: 'stopped',
-  currentServerName: '',
-  expectedExit: false,
-  isCapturing: false,
-  captureBuffer: [],
-  cleanupListeners: null,
-})
-
-// 从 globalThis 读取共享运行时，使新插件实例可以在热重载后复用旧进程句柄。
-const getRuntime = () => {
-  const host = globalThis as typeof globalThis & { [runtimeKey]?: PluginRuntime }
-  host[runtimeKey] ??= createRuntime()
-  return host[runtimeKey]
-}
-
 // 指令配置接口
 export interface CommandConfig {
   setServer: string
@@ -87,149 +54,26 @@ export const Config: Schema<Config> = Schema.object({
   llmPrefix: Schema.string().default('执行/').description('LLM触发前缀（匹配到后将其后内容发送到服务端控制台）'),
   llmBotIds: Schema.array(String).default([]).description('允许触发后台指令的云端机器人账号ID'),
   commands: CommandConfigSchema.required(),
-}).description('注意：建议启动脚本保持前台运行，不要在脚本内自行脱离控制台。')
+}).description('注意：重载配置会导致服务器进程 PID 丢失，重载配置前，请先停止服务器进程！')
 
 // 延时函数
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 export function apply(ctx: Context, config: Config) {
-  // runtime 不跟随单次 apply 生命周期销毁，目的是在插件重载后继续管理原有服务端进程。
-  const runtime = getRuntime()
+  // 此处变量存在于插件生命周期内，用于持有服务端进程
+  let mcProcess: ChildProcess | null = null
+  let isCapturing = false
+  let captureBuffer: string[] = []
+  let currentServerName = Object.keys(config.serverPaths)[0] || ''
+
   const logger = ctx.logger('MC-Server')
   const decoder = new TextDecoder(config.encoding)
 
-  // 首次加载插件时默认选择第一项服务端；重载后保留用户之前切换的目标服务端。
-  if (!runtime.currentServerName) {
-    runtime.currentServerName = Object.keys(config.serverPaths)[0] || ''
-  }
-
   const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-  // 统一判断当前托管中的子进程是否仍然可用，避免仅凭对象存在就误判为运行中。
-  const isProcessAlive = (child: ChildProcess | null = runtime.child) => {
-    return !!child && !!child.pid && child.exitCode === null && !child.killed
-  }
-
-  // 清理一次命令输出捕获的临时状态，防止重载或退出后残留旧缓冲区。
-  const clearCaptureState = () => {
-    runtime.isCapturing = false
-    runtime.captureBuffer = []
-  }
-
-  // 在服务端进程彻底退出后统一重置托管状态。
-  const resetProcessState = () => {
-    runtime.child = null
-    runtime.status = 'stopped'
-    runtime.expectedExit = false
-    clearCaptureState()
-  }
-
-  // 每次热重载都需要移除旧实例绑定的监听器，避免同一子进程被重复监听。
-  const detachProcessListeners = () => {
-    runtime.cleanupListeners?.()
-    runtime.cleanupListeners = null
-  }
-
-  // 关闭服务器时优先等待进程自行退出，超时后再走强杀流程。
-  const waitForClose = (child: ChildProcess, timeout: number) => {
-    return new Promise<boolean>((resolve) => {
-      let settled = false
-      const finish = (closed: boolean) => {
-        if (settled) return
-        settled = true
-        child.off('close', onClose)
-        clearTimeout(timer)
-        resolve(closed)
-      }
-      const onClose = () => finish(true)
-      const timer = setTimeout(() => finish(false), timeout)
-      child.once('close', onClose)
-    })
-  }
-
-  // 将 stdout / stderr / close / error 监听统一绑定到当前托管进程上。
-  const attachProcessListeners = (child: ChildProcess) => {
-    detachProcessListeners()
-
-    const handleStdout = (data: Buffer) => {
-      const chunk = decoder.decode(data, { stream: true }).trim()
-      const lines = chunk.split('\n')
-
-      for (const line of lines) {
-        const rawLog = line.trim()
-        if (!rawLog) continue
-
-        logger.info(rawLog)
-
-        if (!runtime.isCapturing) {
-          const chat = parseChat(rawLog)
-          if (chat) {
-            const msg = `[MC] ${chat.player}: ${chat.message}`
-            void broadcastToGroup(msg)
-            void injectMcChatToKoishi(chat.player, chat.message)
-          }
-        } else {
-          const cleanContent = cleanLog(rawLog)
-          if (cleanContent) {
-            runtime.captureBuffer.push(cleanContent)
-          }
-        }
-      }
-    }
-
-    const handleStderr = (data: Buffer) => {
-      logger.warn(data.toString().trim())
-    }
-
-    // close 是最终态：无论正常关服还是异常退出，都在这里统一清理共享状态并发送对应广播。
-    const handleClose = (code: number | null) => {
-      logger.info(`服务端进程已退出，代码: ${code}`)
-      const wasExpected = runtime.expectedExit
-      detachProcessListeners()
-      resetProcessState()
-      void broadcastToGroup(wasExpected ? '服务器似了啦，都你害的' : '哎......服务器怎么寄了~')
-    }
-
-    const handleError = (error: Error) => {
-      logger.error(`服务端进程异常: ${error.message}`)
-    }
-
-    child.stdout?.on('data', handleStdout)
-    child.stderr?.on('data', handleStderr)
-    child.on('close', handleClose)
-    child.on('error', handleError)
-
-    // 保存当前实例的解绑函数，供下次热重载或插件卸载时使用。
-    runtime.cleanupListeners = () => {
-      child.stdout?.off('data', handleStdout)
-      child.stderr?.off('data', handleStderr)
-      child.off('close', handleClose)
-      child.off('error', handleError)
-    }
-  }
-
-  // 如果共享状态里残留的是失效句柄，则在新实例接管前先清空。
-  if (runtime.child && !isProcessAlive(runtime.child)) {
-    detachProcessListeners()
-    resetProcessState()
-  }
-
-  // 热重载后重新绑定现有子进程监听器，恢复插件对旧服务端进程的控制能力。
-  if (runtime.child && isProcessAlive(runtime.child)) {
-    attachProcessListeners(runtime.child)
-    runtime.status = runtime.status === 'stopping' ? 'stopping' : 'running'
-    logger.info(`检测到已存在的服务端进程，已重新绑定监听器 (PID: ${runtime.child.pid})`)
-  }
-
-  // 插件卸载/重载时只解绑监听器，不主动终止服务端进程。
-  ctx.on('dispose', () => {
-    detachProcessListeners()
-  })
-
-  // 监听群消息，提取云端LLM触发的控制台指令
+  // 监听群消息，提取云端LLM触发的控制台指令（适用于分布式部署）
   ctx.on('message', async (session: any) => {
-    const mcProcess = runtime.child
-    if (!isProcessAlive(mcProcess) || !config.llmPrefix) return
+    if (!mcProcess || !config.llmPrefix) return
 
     const targetGroupId = session.guildId || session.channelId
     const userId = session.userId
@@ -420,7 +264,7 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      if (isProcessAlive()) return '服务器开着呢，不能热插拔啦~'
+      if (mcProcess) return '服务器开着呢，不能热插拔啦~'
 
       // 检查服务端名称
       if (!Object.keys(config.serverPaths).includes(name) || !name) {
@@ -437,7 +281,7 @@ export function apply(ctx: Context, config: Config) {
         return `服务器路径"${targetPath}"不可用！`
       }
 
-      runtime.currentServerName = name
+      currentServerName = name
       return '当前服务器已切换为 ' + name + '\n' + targetPath
     })
 
@@ -448,69 +292,68 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      if (isProcessAlive()) {
-        return '别吵别吵，服务器已经在运行了，PID: ' + runtime.child.pid
-      }
-
-      if (runtime.status === 'starting') {
-        return '服务器正在启动中，请稍等~'
+      if (mcProcess) {
+        return '别吵别吵，服务器已经在运行了，PID: ' + mcProcess.pid
       }
 
       // 检查服务端名称
-      if (!runtime.currentServerName) {
+      if (!currentServerName) {
         return '未指定服务端！'
       }
 
-      const targetPath = config.serverPaths[runtime.currentServerName]
-      if (!targetPath || !fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
-        return `服务器路径"${targetPath}"不可用！`
-      }
-      
+      const targetPath = config.serverPaths[currentServerName]
+      session.send(`正在启动${currentServerName}，请等待1~2分钟……`)
+
       try {
-        // 启动阶段先进入 starting，避免用户连续触发重复开服。
-        runtime.status = 'starting'
-        runtime.expectedExit = false
-        clearCaptureState()
+        // 按运行环境启动并保持与子进程连接
+        mcProcess = startProcessByRuntime(targetPath)
 
-        const child = startProcessByRuntime(targetPath)
+        logger.info(`服务器已启动 (PID: ${mcProcess.pid})`)
 
-        // spawn 的失败通常经由 error / close / exit 上报，因此这里显式等待短时间确认启动结果。
-        const startupResult = await new Promise<{ ok: boolean, error?: Error }>((resolve) => {
-          let settled = false
-          const finish = (result: { ok: boolean, error?: Error }) => {
-            if (settled) return
-            settled = true
-            child.off('error', onError)
-            child.off('close', onClose)
-            child.off('exit', onExit)
-            clearTimeout(timer)
-            resolve(result)
+        // 监听服务端日志输出
+        mcProcess.stdout?.on('data', (data) => {
+          const chunk = decoder.decode(data, { stream: true }).trim()
+          const lines = chunk.split('\n')
+
+          for (const line of lines) {
+            const rawLog = line.trim()
+            if (!rawLog) continue
+
+            // 记录日志到后台
+            logger.info(rawLog)
+
+            // 检测聊天信息
+            if (!isCapturing) {
+              const chat = parseChat(rawLog)
+              if (chat) {
+                const msg = `[MC] ${chat.player}: ${chat.message}`
+                broadcastToGroup(msg)
+                injectMcChatToKoishi(chat.player, chat.message)
+              }
+            } else {
+              const cleanContent = cleanLog(rawLog)
+              if (cleanContent) {
+                captureBuffer.push(cleanContent)
+              }
+            }
           }
-          const onError = (error: Error) => finish({ ok: false, error })
-          const onClose = () => finish({ ok: false, error: new Error('启动脚本已退出') })
-          const onExit = () => finish({ ok: false, error: new Error('启动脚本已退出') })
-          const timer = setTimeout(() => finish({ ok: true }), 1500)
-
-          child.once('error', onError)
-          child.once('close', onClose)
-          child.once('exit', onExit)
         })
 
-        if (!startupResult.ok) {
-          runtime.status = 'stopped'
-          runtime.expectedExit = false
-          return '启动出错: ' + startupResult.error.message
-        }
+        // 监听错误流
+        mcProcess.stderr?.on('data', (data) => {
+          logger.warn(data.toString().trim())
+        })
 
-        runtime.child = child
-        runtime.status = 'running'
-        attachProcessListeners(child)
-        logger.info(`服务器已启动并接管进程 (PID: ${child.pid})`)
-        return `正在启动${runtime.currentServerName}，PID: ${child.pid}`
+        // 监听进程结束
+        mcProcess.on('close', (code) => {
+          logger.info(`服务端进程已退出，代码: ${code}`)
+          mcProcess = null
+          broadcastToGroup(`服务器似了啦，都你害的`)
+        })
 
       } catch (e) {
         logger.error(e)
-        resetProcessState()
+        mcProcess = null
         return '启动出错: ' + e.message
       }
     })
@@ -522,23 +365,19 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) {
+      if (!mcProcess) {
         return '服务器都没开你关什么……'
       }
 
       const currentPid = mcProcess.pid
 
       try {
-        // 标记为预期退出，避免 close 时被误判成崩服广播。
-        runtime.expectedExit = true
-        runtime.status = 'stopping'
         mcProcess.stdin?.write('stop\n')
         session.send('stop指令发送喽~')
 
-        const closed = await waitForClose(mcProcess, 10000)
+        await sleep(10000)
 
-        if (!closed && isProcessAlive(mcProcess)) {
+        if (mcProcess) {
           session.send('stop无法正常关闭，强制处决中......')
           killProcessByRuntime(currentPid, true, (error) => {
             if (error) {
@@ -553,8 +392,6 @@ export function apply(ctx: Context, config: Config) {
         return
       } catch (e) {
         logger.error(e)
-        runtime.expectedExit = false
-        runtime.status = isProcessAlive(mcProcess) ? 'running' : 'stopped'
         return '停止指令发送失败: ' + e.message
       }
     })
@@ -566,8 +403,7 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) {
+      if (!mcProcess) {
         return '服务器都没开，你sudo你🐎呢'
       }
 
@@ -577,25 +413,24 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        runtime.isCapturing = true
-        runtime.captureBuffer = []
+        isCapturing = true // 开始捕获输出
+        captureBuffer = []
 
         mcProcess.stdin?.write(command + '\n')
 
         await sleep(1000)
 
-        runtime.isCapturing = false
+        isCapturing = false // 停止捕获输出
 
-        if (runtime.captureBuffer.length === 0) {
+        if (captureBuffer.length === 0) {
           return '命令已发送，无输出'
         }
 
-        const output = runtime.captureBuffer.join('\n')
-        runtime.captureBuffer = []
+        const output = captureBuffer.join('\n')
         return output.length > 300 ? output.substring(0, 300) + '\n...（消息过长，已截断）' : output
 
       } catch (e) {
-        runtime.isCapturing = false
+        isCapturing = false // 停止捕获输出
         logger.error(e)
         return '命令发送失败: ' + e.message
       }
@@ -608,8 +443,7 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有发送信息的权限！'
 
       // 状态检查
-      const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) return '服务器都没开，你say你🐎呢'
+      if (!mcProcess) return '服务器都没开，你say你🐎呢'
 
       // 内容检查
       if (!content) return '你say你🐎呢'
@@ -631,29 +465,27 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) return '服务器都没开，你list你🐎呢'
+      if (!mcProcess) return '服务器都没开，你list你🐎呢'
 
       try {
-        runtime.isCapturing = true
-        runtime.captureBuffer = []
+        isCapturing = true
+        captureBuffer = []
 
         mcProcess.stdin?.write('list\n')
 
         await sleep(2000)
 
-        runtime.isCapturing = false
+        isCapturing = false
 
-        if (runtime.captureBuffer.length === 0) {
+        if (captureBuffer.length === 0) {
           return '命令已发送，但无输出'
         }
 
-        const output = runtime.captureBuffer.join('\n')
-        runtime.captureBuffer = []
+        const output = captureBuffer.join('\n')
         return output.length > 500 ? output.substring(0, 500) + '\n...（消息过长）' : output
 
       } catch (e) {
-        runtime.isCapturing = false
+        isCapturing = false
         logger.error(e)
         return '查询失败: ' + e.message
       }
@@ -666,17 +498,13 @@ export function apply(ctx: Context, config: Config) {
       if (!checkPermission(session)) return '你没有控制服务器的权限！'
 
       // 状态检查
-      const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) {
+      if (!mcProcess || mcProcess.killed) {
         return '服务器未运行，或者已经似了'
       }
 
       const currentPid = mcProcess.pid
 
       try {
-        // 强杀同样属于预期退出，最终状态仍交由 close 回调统一收口。
-        runtime.expectedExit = true
-        runtime.status = 'stopping'
         killProcessByRuntime(currentPid, true, (error) => {
           if (error) {
             logger.error(`杀死服务端进程失败: ${error.message}`)
