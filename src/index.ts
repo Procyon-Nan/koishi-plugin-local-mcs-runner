@@ -1,13 +1,195 @@
-import { Context } from 'koishi'
+import { Context, Schema } from 'koishi'
 import { spawn, ChildProcess, exec } from 'child_process'
 import * as fs from 'fs'
 import { TextDecoder } from 'util'
-export { Config } from './config'
-import type { Config as PluginConfig } from './config'
+
+// 指令配置：各条 Koishi 指令的触发词
+export interface CommandConfig {
+  setServer: string
+  startServer: string
+  stopServer: string
+  sudo: string
+  say: string
+  list: string
+  killServer: string
+}
+
+// 发送到所有允许群聊的广播消息
+export interface BroadcastConfig {
+  mcChat: string
+  stopByUser: string
+  stopUnexpectedly: string
+}
+
+// 多个命令复用的通用返回消息
+export interface CommonResponseConfig {
+  noControlPermission: string
+  pathUnavailable: string
+  serverNotRunning: string
+  killFailed: string
+}
+
+// 切换服务端命令的返回消息
+export interface SetServerResponseConfig {
+  runningBlocked: string
+  invalidName: string
+  success: string
+}
+
+// 开服命令的返回消息
+export interface StartServerResponseConfig {
+  alreadyRunning: string
+  starting: string
+  noServerSelected: string
+  startFailed: string
+  startAccepted: string
+}
+
+// 关服命令的返回消息
+export interface StopServerResponseConfig {
+  stopCommandSent: string
+  forceKilling: string
+  stopFailed: string
+}
+
+// sudo 命令的返回消息
+export interface SudoResponseConfig {
+  emptyCommand: string
+  noOutput: string
+  sendFailed: string
+}
+
+// say 命令的返回消息
+export interface SayResponseConfig {
+  noPermission: string
+  emptyContent: string
+  sendFailed: string
+}
+
+// list 命令的返回消息
+export interface ListResponseConfig {
+  noOutput: string
+  queryFailed: string
+}
+
+// 强制终止命令的返回消息
+export interface KillServerResponseConfig {
+  killSuccess: string
+}
+
+// 返回消息总配置：common 用于复用，其余按命令拆分
+export interface ResponseConfig {
+  common: CommonResponseConfig
+  setServer: SetServerResponseConfig
+  startServer: StartServerResponseConfig
+  stopServer: StopServerResponseConfig
+  sudo: SudoResponseConfig
+  say: SayResponseConfig
+  list: ListResponseConfig
+  killServer: KillServerResponseConfig
+}
+
+// 插件主配置：包含服务端路径、权限、广播消息、命令回复消息和指令触发词
+export interface Config {
+  serverPaths: Record<string, string>
+  batName: string
+  allowedGroups: string[]
+  adminIds: string[]
+  runtime: 'windows' | 'linux'
+  encoding: 'utf-8' | 'gbk'
+  injectMcChatToKoishi: boolean
+  injectTargetGroup: string
+  llmPrefix: string
+  llmBotIds: string[]
+  commands: CommandConfig
+  broadcasts: BroadcastConfig
+  responses: ResponseConfig
+}
+
+// 指令配置 Schema
+const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
+  setServer: Schema.string().default('setserver').description('切换服务器指令'),
+  startServer: Schema.string().default('开服').description('启动服务器指令'),
+  stopServer: Schema.string().default('关服').description('关闭服务器指令'),
+  sudo: Schema.string().default('sudo').description('发送控制台命令指令'),
+  say: Schema.string().default('say').description('发送消息指令'),
+  list: Schema.string().default('list').description('查询在线玩家指令'),
+  killServer: Schema.string().default('杀死服务器进程').description('强制终止服务器指令'),
+}).description('指令配置')
+
+// 广播消息 Schema
+const BroadcastConfigSchema: Schema<BroadcastConfig> = Schema.object({
+  mcChat: Schema.string().default('[MC] {player}: {message}').description('MC 聊天转发到群聊的广播模板'),
+  stopByUser: Schema.string().default('服务器似了啦，都你害的').description('主动关服时的群聊广播'),
+  stopUnexpectedly: Schema.string().default('哎......服务器怎么寄了~').description('服务端非预期退出时的群聊广播'),
+}).description('广播到所有群聊的消息配置')
+
+// 指令返回消息 Schema
+const ResponseConfigSchema: Schema<ResponseConfig> = Schema.object({
+  common: Schema.object({
+    noControlPermission: Schema.string().default('你没有控制服务器的权限！').description('无控制权限时的提示'),
+    pathUnavailable: Schema.string().default('服务器路径"{path}"不可用！').description('服务端路径不可用时的提示'),
+    serverNotRunning: Schema.string().default('服务器没开呢~').description('服务器未运行时的提示'),
+    killFailed: Schema.string().default('处决失败！系统返回错误：{error}').description('执行强制终止失败时的提示'),
+  }).description('通用返回消息'),
+  setServer: Schema.object({
+    runningBlocked: Schema.string().default('服务器开着呢，不能热插拔啦~').description('运行中禁止切换服务端时的提示'),
+    invalidName: Schema.string().default('爬！服务器列表里只有\n{available}').description('服务端名称无效时的提示'),
+    success: Schema.string().default('当前服务器已切换为 {name}\n{path}').description('切换服务端成功时的提示'),
+  }).description('切换服务端命令返回消息'),
+  startServer: Schema.object({
+    alreadyRunning: Schema.string().default('别吵别吵，服务器已经在运行了，PID: {pid}').description('服务器已在运行时的提示'),
+    starting: Schema.string().default('服务器正在启动中，请稍等~').description('服务器正在启动时的提示'),
+    noServerSelected: Schema.string().default('未指定服务端！').description('未指定服务端时的提示'),
+    startFailed: Schema.string().default('启动出错: {error}').description('启动失败时的提示'),
+    startAccepted: Schema.string().default('正在启动{serverName}，PID: {pid}').description('启动成功接管进程时的提示'),
+  }).description('开服命令返回消息'),
+  stopServer: Schema.object({
+    stopCommandSent: Schema.string().default('stop指令发送喽~').description('已发送 stop 指令时的提示'),
+    forceKilling: Schema.string().default('stop无法正常关闭，强制处决中......').description('stop 超时后开始强制终止时的提示'),
+    stopFailed: Schema.string().default('停止指令发送失败: {error}').description('发送 stop 指令失败时的提示'),
+  }).description('关服命令返回消息'),
+  sudo: Schema.object({
+    emptyCommand: Schema.string().default('你sudo你🐎呢').description('未提供控制台命令时的提示'),
+    noOutput: Schema.string().default('命令已发送，无输出').description('控制台命令无输出时的提示'),
+    sendFailed: Schema.string().default('命令发送失败: {error}').description('控制台命令发送失败时的提示'),
+  }).description('sudo 命令返回消息'),
+  say: Schema.object({
+    noPermission: Schema.string().default('你没有发送信息的权限！').description('无 say 权限时的提示'),
+    emptyContent: Schema.string().default('你say你🐎呢').description('未提供 say 内容时的提示'),
+    sendFailed: Schema.string().default('发送失败: {error}').description('say 命令失败时的提示'),
+  }).description('say 命令返回消息'),
+  list: Schema.object({
+    noOutput: Schema.string().default('命令已发送，但无输出').description('list 命令无输出时的提示'),
+    queryFailed: Schema.string().default('查询失败: {error}').description('list 命令失败时的提示'),
+  }).description('list 命令返回消息'),
+  killServer: Schema.object({
+    killSuccess: Schema.string().default('处决成功！已清理进程~').description('强制终止成功时的提示'),
+  }).description('强制终止命令返回消息'),
+}).description('命令执行后的返回消息配置')
+
+// 插件主配置 Schema
+export const Config: Schema<Config> = Schema.object({
+  runtime: Schema.union(['windows', 'linux']).default('windows').description('运行环境'),
+  serverPaths: Schema.dict(String).role('table').description('服务端名称与目录（绝对路径）').required(),
+  batName: Schema.string().description('启动脚本名称').required(),
+  allowedGroups: Schema.array(String).default([]).description('允许控制的群组'),
+  adminIds: Schema.array(String).description('允许控制的用户账号').required(),
+  encoding: Schema.union(['utf-8', 'gbk']).default('utf-8').description('服务端日志编码'),
+  injectMcChatToKoishi: Schema.boolean().default(false).description('将MC玩家聊天注入到Koishi消息处理链'),
+  injectTargetGroup: Schema.string().default('').description('注入目标群组ID（留空则使用allowedGroups）'),
+  llmPrefix: Schema.string().default('执行/').description('LLM触发前缀（匹配到后将其后内容发送到服务端控制台）'),
+  llmBotIds: Schema.array(String).default([]).description('允许触发后台指令的云端机器人账号ID'),
+  commands: CommandConfigSchema.required(),
+  tipsTittle: Schema.object({}).description('消息配置可用的模板变量'),
+  tipsMessage: Schema.object({}).description('{player} {message} {available} {name} {path} {serverName} {pid} {error}'),
+  broadcasts: BroadcastConfigSchema.required(),
+  responses: ResponseConfigSchema.required(),
+}).description('注意：建议启动脚本保持前台运行，不要在脚本内自行脱离控制台。')
 
 export const name = 'local-mcs-runner'
 
-// 运行时状态提升到全局，用于在 Koishi 热重载插件时保留对子进程的控制句柄。
+// 运行时状态提升到全局，用于在 Koishi 热重载插件时保留对子进程的控制句柄
 type RuntimeStatus = 'stopped' | 'starting' | 'running' | 'stopping'
 
 interface PluginRuntime {
@@ -22,7 +204,7 @@ interface PluginRuntime {
 
 const runtimeKey = Symbol.for('koishi-plugin-local-mcs-runner.runtime')
 
-// 初始化全局共享运行时；仅在当前 Node 进程首次加载插件时创建一次。
+// 初始化全局共享运行时；仅在当前 Node 进程首次加载插件时创建一次
 const createRuntime = (): PluginRuntime => ({
   child: null,
   status: 'stopped',
@@ -33,7 +215,7 @@ const createRuntime = (): PluginRuntime => ({
   cleanupListeners: null,
 })
 
-// 从 globalThis 读取共享运行时，使新插件实例可以在热重载后复用旧进程句柄。
+// 从 globalThis 读取共享运行时，使新插件实例可以在热重载后复用旧进程句柄
 const getRuntime = () => {
   const host = globalThis as typeof globalThis & { [runtimeKey]?: PluginRuntime }
   host[runtimeKey] ??= createRuntime()
@@ -43,38 +225,38 @@ const getRuntime = () => {
 // 延时函数
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-export function apply(ctx: Context, config: PluginConfig) {
-  // runtime 不跟随单次 apply 生命周期销毁，目的是在插件重载后继续管理原有服务端进程。
+export function apply(ctx: Context, config: Config) {
+  // runtime 不跟随单次 apply 生命周期销毁，在插件重载后继续管理原有服务端进程
   const runtime = getRuntime()
   const logger = ctx.logger('MC-Server')
   const decoder = new TextDecoder(config.encoding)  
 
-  // 首次加载插件时默认选择第一项服务端；重载后保留用户之前切换的目标服务端。
+  // 首次加载插件时默认选择第一项服务端；重载后保留用户之前切换的目标服务端
   if (!runtime.currentServerName) {
     runtime.currentServerName = Object.keys(config.serverPaths)[0] || ''
   }
 
   const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-  // 统一替换可配置文案中的占位符，供广播内容和命令返回消息复用。
+  // 替换可配置文案中的占位符，供广播内容和命令返回消息复用
   const formatTemplate = (template: string, params: Record<string, string | number>) => {
     return template.replace(/\{(\w+)\}/g, (_, key: string) => {
       return params[key] === undefined ? `{${key}}` : String(params[key])
     })
   }
 
-  // 统一判断当前托管中的子进程是否仍然可用，避免仅凭对象存在就误判为运行中。
+  // 判断当前托管中的子进程是否仍然可用，避免仅凭对象存在就误判为运行中
   const isProcessAlive = (child: ChildProcess | null = runtime.child) => {
     return !!child && !!child.pid && child.exitCode === null && !child.killed
   }
 
-  // 清理一次命令输出捕获的临时状态，防止重载或退出后残留旧缓冲区。
+  // 清理一次命令输出捕获的临时状态，防止重载或退出后残留旧缓冲区
   const clearCaptureState = () => {
     runtime.isCapturing = false
     runtime.captureBuffer = []
   }
 
-  // 在服务端进程彻底退出后统一重置托管状态。
+  // 在服务端进程彻底退出后统一重置托管状态
   const resetProcessState = () => {
     runtime.child = null
     runtime.status = 'stopped'
@@ -82,13 +264,13 @@ export function apply(ctx: Context, config: PluginConfig) {
     clearCaptureState()
   }
 
-  // 每次热重载都需要移除旧实例绑定的监听器，避免同一子进程被重复监听。
+  // 移除旧实例绑定的监听器，避免同一子进程被重复监听
   const detachProcessListeners = () => {
     runtime.cleanupListeners?.()
     runtime.cleanupListeners = null
   }
 
-  // 关闭服务器时优先等待进程自行退出，超时后再走强杀流程。
+  // 关闭服务器优先等待进程自行退出，超时后强杀
   const waitForClose = (child: ChildProcess, timeout: number) => {
     return new Promise<boolean>((resolve) => {
       let settled = false
@@ -105,7 +287,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     })
   }
 
-  // 将 stdout / stderr / close / error 监听统一绑定到当前托管进程上。
+  // 将 stdout / stderr / close / error 监听统一绑定到当前托管进程上
   const attachProcessListeners = (child: ChildProcess) => {
     detachProcessListeners()
 
@@ -142,7 +324,7 @@ export function apply(ctx: Context, config: PluginConfig) {
       logger.warn(data.toString().trim())
     }
 
-    // close 是最终态：无论正常关服还是异常退出，都在这里统一清理共享状态并发送对应广播。
+    // 统一清理共享状态并发送对应广播
     const handleClose = (code: number | null) => {
       logger.info(`服务端进程已退出，代码: ${code}`)
       const wasExpected = runtime.expectedExit
@@ -160,7 +342,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     child.on('close', handleClose)
     child.on('error', handleError)
 
-    // 保存当前实例的解绑函数，供下次热重载或插件卸载时使用。
+    // 保存当前实例的解绑函数，供下次热重载或插件卸载时使用
     runtime.cleanupListeners = () => {
       child.stdout?.off('data', handleStdout)
       child.stderr?.off('data', handleStderr)
@@ -169,20 +351,20 @@ export function apply(ctx: Context, config: PluginConfig) {
     }
   }
 
-  // 如果共享状态里残留的是失效句柄，则在新实例接管前先清空。
+  // 如果共享状态里残留的是失效句柄，则在新实例接管前清空
   if (runtime.child && !isProcessAlive(runtime.child)) {
     detachProcessListeners()
     resetProcessState()
   }
 
-  // 热重载后重新绑定现有子进程监听器，恢复插件对旧服务端进程的控制能力。
+  // 热重载后重新绑定现有子进程监听器，恢复插件对旧服务端进程的控制能力
   if (runtime.child && isProcessAlive(runtime.child)) {
     attachProcessListeners(runtime.child)
     runtime.status = runtime.status === 'stopping' ? 'stopping' : 'running'
     logger.info(`检测到已存在的服务端进程，已重新绑定监听器 (PID: ${runtime.child.pid})`)
   }
 
-  // 插件卸载/重载时只解绑监听器，不主动终止服务端进程。
+  // 插件卸载/重载时只解绑监听器，不主动终止服务端进程
   ctx.on('dispose', () => {
     detachProcessListeners()
   })
@@ -367,7 +549,7 @@ export function apply(ctx: Context, config: PluginConfig) {
     }
   }
 
-  // 功能：权限检查
+  // 权限检查
   const checkPermission = (session: any) => {
     const isGroupAllowed = config.allowedGroups.includes(session.guildId)
     const isUserAllowed = config.adminIds.includes(session.userId)
@@ -431,14 +613,14 @@ export function apply(ctx: Context, config: PluginConfig) {
       }
 
       try {
-        // 启动阶段先进入 starting，避免用户连续触发重复开服。
+        // 启动阶段先进入 starting，避免用户连续触发重复开服
         runtime.status = 'starting'
         runtime.expectedExit = false
         clearCaptureState()
 
         const child = startProcessByRuntime(targetPath)
 
-        // spawn 的失败通常经由 error / close / exit 上报，因此这里显式等待短时间确认启动结果。
+        // spawn 的失败通常经由 error / close / exit 上报，因此这里显式等待短时间确认启动结果
         const startupResult = await new Promise<{ ok: boolean, error?: Error }>((resolve) => {
           let settled = false
           const finish = (result: { ok: boolean, error?: Error }) => {
@@ -497,7 +679,7 @@ export function apply(ctx: Context, config: PluginConfig) {
       const currentPid = mcProcess.pid
 
       try {
-        // 标记为预期退出，避免 close 时被误判成崩服广播。
+        // 标记为预期退出，避免 close 时被误判成崩服广播
         runtime.expectedExit = true
         runtime.status = 'stopping'
         mcProcess.stdin?.write('stop\n')

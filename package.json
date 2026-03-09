@@ -3,12 +3,21 @@
   "koishi": {
     "description": {
       "en": "A plugin to manage local Minecraft server through chatbot commands.",
-      "zh": "通过聊天机器人指令管理本地Minecraft服务器的插件"
+      "zh": "通过聊天机器人指令管理本地Minecraft服务器"
     }
   },
-  "version": "1.0.9",
+  "version": "1.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js",
+      "require": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": true,
   "files": [
     "lib",
     "dist"

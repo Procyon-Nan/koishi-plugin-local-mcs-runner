@@ -103,7 +103,7 @@ export interface Config {
   responses: ResponseConfig
 }
 
-// 指令配置 Schema。
+// 指令配置 Schema
 const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
   setServer: Schema.string().default('setserver').description('切换服务器指令'),
   startServer: Schema.string().default('开服').description('启动服务器指令'),
@@ -114,14 +114,14 @@ const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
   killServer: Schema.string().default('杀死服务器进程').description('强制终止服务器指令'),
 }).description('指令配置')
 
-// 广播文案 Schema。
+// 广播信息 Schema
 const BroadcastConfigSchema: Schema<BroadcastConfig> = Schema.object({
   mcChat: Schema.string().default('[MC] {player}: {message}').description('MC 聊天转发到群聊的广播模板'),
   stopByUser: Schema.string().default('服务器似了啦，都你害的').description('主动关服时的群聊广播'),
   stopUnexpectedly: Schema.string().default('哎......服务器怎么寄了~').description('服务端非预期退出时的群聊广播'),
 }).description('广播到所有群聊的消息配置')
 
-// 返回文案支持模板变量：
+// 指令返回信息 Schema
 const ResponseConfigSchema: Schema<ResponseConfig> = Schema.object({
   common: Schema.object({
     noControlPermission: Schema.string().default('你没有控制服务器的权限！').description('无控制权限时的提示'),
@@ -178,8 +178,8 @@ export const Config: Schema<Config> = Schema.object({
   llmPrefix: Schema.string().default('执行/').description('LLM触发前缀（匹配到后将其后内容发送到服务端控制台）'),
   llmBotIds: Schema.array(String).default([]).description('允许触发后台指令的云端机器人账号ID'),
   commands: CommandConfigSchema.required(),
-  tipsTittle : Schema.object({}).description('消息配置可用的模板变量'),
-  tipsMessage : Schema.object({}).description('{player} {message} {available} {name} {path} {serverName} {pid} {error}'),
-  broadcasts: BroadcastConfigSchema,
-    responses: ResponseConfigSchema,
+  tipsTittle: Schema.object({}).description('消息配置可用的模板变量'),
+  tipsMessage: Schema.object({}).description('{player} {message} {available} {name} {path} {serverName} {pid} {error}'),
+  broadcasts: BroadcastConfigSchema.required(),
+  responses: ResponseConfigSchema.required(),
 }).description('注意：建议启动脚本保持前台运行，不要在脚本内自行脱离控制台。')
