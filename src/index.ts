@@ -1,7 +1,9 @@
-import { Context, Schema } from 'koishi'
+import { Context } from 'koishi'
 import { spawn, ChildProcess, exec } from 'child_process'
 import * as fs from 'fs'
 import { TextDecoder } from 'util'
+export { Config } from './config'
+import type { Config as PluginConfig } from './config'
 
 export const name = 'local-mcs-runner'
 
@@ -38,65 +40,14 @@ const getRuntime = () => {
   return host[runtimeKey]
 }
 
-// 指令配置接口
-export interface CommandConfig {
-  setServer: string
-  startServer: string
-  stopServer: string
-  sudo: string
-  say: string
-  list: string
-  killServer: string
-}
-
-// 网页控制台配置项
-export interface Config {
-  serverPaths: Record<string, string>
-  batName: string
-  allowedGroups: string[]
-  adminIds: string[]
-  runtime: 'windows' | 'linux'
-  encoding: 'utf-8' | 'gbk'
-  injectMcChatToKoishi: boolean
-  injectTargetGroup: string
-  llmPrefix: string
-  llmBotIds: string[]
-  commands: CommandConfig
-}
-
-// 指令配置 Schema
-const CommandConfigSchema: Schema<CommandConfig> = Schema.object({
-  setServer: Schema.string().default('setserver').description('切换服务器指令'),
-  startServer: Schema.string().default('开服').description('启动服务器指令'),
-  stopServer: Schema.string().default('关服').description('关闭服务器指令'),
-  sudo: Schema.string().default('sudo').description('发送控制台命令指令'),
-  say: Schema.string().default('say').description('发送消息指令'),
-  list: Schema.string().default('list').description('查询在线玩家指令'),
-  killServer: Schema.string().default('杀死服务器进程').description('强制终止服务器指令'),
-}).description('指令触发消息配置')
-
-export const Config: Schema<Config> = Schema.object({
-  runtime: Schema.union(['windows', 'linux']).default('windows').description('运行环境'),
-  serverPaths: Schema.dict(String).role('table').description('服务端名称与目录（绝对路径）').required(),
-  batName: Schema.string().description('启动脚本名称').required(),
-  allowedGroups: Schema.array(String).default([]).description('允许控制的群组'),
-  adminIds: Schema.array(String).description('允许控制的用户账号').required(),
-  encoding: Schema.union(['utf-8', 'gbk']).default('utf-8').description('服务端日志编码'),
-  injectMcChatToKoishi: Schema.boolean().default(false).description('将MC玩家聊天注入到Koishi消息处理链'),
-  injectTargetGroup: Schema.string().default('').description('注入目标群组ID（留空则使用allowedGroups）'),
-  llmPrefix: Schema.string().default('执行/').description('LLM触发前缀（匹配到后将其后内容发送到服务端控制台）'),
-  llmBotIds: Schema.array(String).default([]).description('允许触发后台指令的云端机器人账号ID'),
-  commands: CommandConfigSchema.required(),
-}).description('注意：建议启动脚本保持前台运行，不要在脚本内自行脱离控制台。')
-
 // 延时函数
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-export function apply(ctx: Context, config: Config) {
+export function apply(ctx: Context, config: PluginConfig) {
   // runtime 不跟随单次 apply 生命周期销毁，目的是在插件重载后继续管理原有服务端进程。
   const runtime = getRuntime()
   const logger = ctx.logger('MC-Server')
-  const decoder = new TextDecoder(config.encoding)
+  const decoder = new TextDecoder(config.encoding)  
 
   // 首次加载插件时默认选择第一项服务端；重载后保留用户之前切换的目标服务端。
   if (!runtime.currentServerName) {
@@ -104,6 +55,13 @@ export function apply(ctx: Context, config: Config) {
   }
 
   const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+  // 统一替换可配置文案中的占位符，供广播内容和命令返回消息复用。
+  const formatTemplate = (template: string, params: Record<string, string | number>) => {
+    return template.replace(/\{(\w+)\}/g, (_, key: string) => {
+      return params[key] === undefined ? `{${key}}` : String(params[key])
+    })
+  }
 
   // 统一判断当前托管中的子进程是否仍然可用，避免仅凭对象存在就误判为运行中。
   const isProcessAlive = (child: ChildProcess | null = runtime.child) => {
@@ -164,7 +122,10 @@ export function apply(ctx: Context, config: Config) {
         if (!runtime.isCapturing) {
           const chat = parseChat(rawLog)
           if (chat) {
-            const msg = `[MC] ${chat.player}: ${chat.message}`
+            const msg = formatTemplate(config.broadcasts.mcChat, {
+              player: chat.player,
+              message: chat.message,
+            })
             void broadcastToGroup(msg)
             void injectMcChatToKoishi(chat.player, chat.message)
           }
@@ -187,7 +148,7 @@ export function apply(ctx: Context, config: Config) {
       const wasExpected = runtime.expectedExit
       detachProcessListeners()
       resetProcessState()
-      void broadcastToGroup(wasExpected ? '服务器似了啦，都你害的' : '哎......服务器怎么寄了~')
+      void broadcastToGroup(wasExpected ? config.broadcasts.stopByUser : config.broadcasts.stopUnexpectedly)
     }
 
     const handleError = (error: Error) => {
@@ -417,55 +378,58 @@ export function apply(ctx: Context, config: Config) {
   ctx.command(`${config.commands.setServer} <name:string>`, '指定当前操作的服务端')
     .action(async ({ session }, name) => {
       // 权限检查
-      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return config.responses.common.noControlPermission
 
       // 状态检查
-      if (isProcessAlive()) return '服务器开着呢，不能热插拔啦~'
+      if (isProcessAlive()) return config.responses.setServer.runningBlocked
 
       // 检查服务端名称
       if (!Object.keys(config.serverPaths).includes(name) || !name) {
         const available = Object.keys(config.serverPaths).join(' | ')
-        return '爬！服务器列表里只有\n' + available
+        return formatTemplate(config.responses.setServer.invalidName, { available })
       }
 
       const targetPath = config.serverPaths[name]
       try {
         if (!targetPath || !fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
-          return `服务器路径"${targetPath}"不可用！`
+          return formatTemplate(config.responses.common.pathUnavailable, { path: targetPath })
         }
       } catch (e) {
-        return `服务器路径"${targetPath}"不可用！`
+        return formatTemplate(config.responses.common.pathUnavailable, { path: targetPath })
       }
 
       runtime.currentServerName = name
-      return '当前服务器已切换为 ' + name + '\n' + targetPath
+      return formatTemplate(config.responses.setServer.success, {
+        name,
+        path: targetPath,
+      })
     })
 
   // 指令：开启服务器
   ctx.command(config.commands.startServer, '启动MC服务器')
     .action(async ({ session }) => {
       // 权限检查
-      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return config.responses.common.noControlPermission
 
       // 状态检查
       if (isProcessAlive()) {
-        return '别吵别吵，服务器已经在运行了，PID: ' + runtime.child.pid
+        return formatTemplate(config.responses.startServer.alreadyRunning, { pid: runtime.child.pid })
       }
 
       if (runtime.status === 'starting') {
-        return '服务器正在启动中，请稍等~'
+        return config.responses.startServer.starting
       }
 
       // 检查服务端名称
       if (!runtime.currentServerName) {
-        return '未指定服务端！'
+        return config.responses.startServer.noServerSelected
       }
 
       const targetPath = config.serverPaths[runtime.currentServerName]
       if (!targetPath || !fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
-        return `服务器路径"${targetPath}"不可用！`
+        return formatTemplate(config.responses.common.pathUnavailable, { path: targetPath })
       }
-      
+
       try {
         // 启动阶段先进入 starting，避免用户连续触发重复开服。
         runtime.status = 'starting'
@@ -499,19 +463,22 @@ export function apply(ctx: Context, config: Config) {
         if (!startupResult.ok) {
           runtime.status = 'stopped'
           runtime.expectedExit = false
-          return '启动出错: ' + startupResult.error.message
+          return formatTemplate(config.responses.startServer.startFailed, { error: startupResult.error.message })
         }
 
         runtime.child = child
         runtime.status = 'running'
         attachProcessListeners(child)
         logger.info(`服务器已启动并接管进程 (PID: ${child.pid})`)
-        return `正在启动${runtime.currentServerName}，PID: ${child.pid}`
+        return formatTemplate(config.responses.startServer.startAccepted, {
+          serverName: runtime.currentServerName,
+          pid: child.pid,
+        })
 
       } catch (e) {
         logger.error(e)
         resetProcessState()
-        return '启动出错: ' + e.message
+        return formatTemplate(config.responses.startServer.startFailed, { error: e.message })
       }
     })
 
@@ -519,12 +486,12 @@ export function apply(ctx: Context, config: Config) {
   ctx.command(config.commands.stopServer, '关闭MC服务器')
     .action(async ({ session }) => {
       // 权限校验
-      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return config.responses.common.noControlPermission
 
       // 状态检查
       const mcProcess = runtime.child
       if (!isProcessAlive(mcProcess)) {
-        return '服务器都没开你关什么……'
+        return config.responses.common.serverNotRunning
       }
 
       const currentPid = mcProcess.pid
@@ -534,16 +501,16 @@ export function apply(ctx: Context, config: Config) {
         runtime.expectedExit = true
         runtime.status = 'stopping'
         mcProcess.stdin?.write('stop\n')
-        session.send('stop指令发送喽~')
+        session.send(config.responses.stopServer.stopCommandSent)
 
         const closed = await waitForClose(mcProcess, 10000)
 
         if (!closed && isProcessAlive(mcProcess)) {
-          session.send('stop无法正常关闭，强制处决中......')
+          session.send(config.responses.stopServer.forceKilling)
           killProcessByRuntime(currentPid, true, (error) => {
             if (error) {
               logger.error(`杀死服务端进程失败: ${error.message}`)
-              session.send(`处决失败！系统返回错误：${error.message}`)
+              session.send(formatTemplate(config.responses.common.killFailed, { error: error.message }))
             } else {
               logger.info(`已执行 ${config.runtime} 进程终止命令，等待进程清理……`)
             }
@@ -555,7 +522,7 @@ export function apply(ctx: Context, config: Config) {
         logger.error(e)
         runtime.expectedExit = false
         runtime.status = isProcessAlive(mcProcess) ? 'running' : 'stopped'
-        return '停止指令发送失败: ' + e.message
+        return formatTemplate(config.responses.stopServer.stopFailed, { error: e.message })
       }
     })
 
@@ -563,17 +530,17 @@ export function apply(ctx: Context, config: Config) {
   ctx.command(`${config.commands.sudo} <command:text>`, '向服务器发送控制台命令')
     .action(async ({ session }, command) => {
       // 权限校验
-      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return config.responses.common.noControlPermission
 
       // 状态检查
       const mcProcess = runtime.child
       if (!isProcessAlive(mcProcess)) {
-        return '服务器都没开，你sudo你🐎呢'
+        return config.responses.common.serverNotRunning
       }
 
       // 命令参数检查
       if (!command) {
-        return '你sudo你🐎呢'
+        return config.responses.sudo.emptyCommand
       }
 
       try {
@@ -587,7 +554,7 @@ export function apply(ctx: Context, config: Config) {
         runtime.isCapturing = false
 
         if (runtime.captureBuffer.length === 0) {
-          return '命令已发送，无输出'
+          return config.responses.sudo.noOutput
         }
 
         const output = runtime.captureBuffer.join('\n')
@@ -597,7 +564,7 @@ export function apply(ctx: Context, config: Config) {
       } catch (e) {
         runtime.isCapturing = false
         logger.error(e)
-        return '命令发送失败: ' + e.message
+        return formatTemplate(config.responses.sudo.sendFailed, { error: e.message })
       }
     })
 
@@ -605,14 +572,14 @@ export function apply(ctx: Context, config: Config) {
   ctx.command(`${config.commands.say} <content:text>`, '向服务器发送信息')
     .action(async ({ session }, content) => {
       // 权限校验
-      if (!checkPermission(session)) return '你没有发送信息的权限！'
+      if (!checkPermission(session)) return config.responses.say.noPermission
 
       // 状态检查
       const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) return '服务器都没开，你say你🐎呢'
+      if (!isProcessAlive(mcProcess)) return config.responses.common.serverNotRunning
 
       // 内容检查
-      if (!content) return '你say你🐎呢'
+      if (!content) return config.responses.say.emptyContent
 
       try {
         const senderName = session.username || session.userId
@@ -620,7 +587,7 @@ export function apply(ctx: Context, config: Config) {
         return null
       } catch (e) {
         logger.error(e)
-        return '发送失败: ' + e.message
+        return formatTemplate(config.responses.say.sendFailed, { error: e.message })
       }
     })
 
@@ -628,11 +595,11 @@ export function apply(ctx: Context, config: Config) {
   ctx.command(config.commands.list, '查询服务器在线玩家')
     .action(async ({ session }) => {
       // 权限校验
-      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return config.responses.common.noControlPermission
 
       // 状态检查
       const mcProcess = runtime.child
-      if (!isProcessAlive(mcProcess)) return '服务器都没开，你list你🐎呢'
+      if (!isProcessAlive(mcProcess)) return config.responses.common.serverNotRunning
 
       try {
         runtime.isCapturing = true
@@ -645,7 +612,7 @@ export function apply(ctx: Context, config: Config) {
         runtime.isCapturing = false
 
         if (runtime.captureBuffer.length === 0) {
-          return '命令已发送，但无输出'
+          return config.responses.list.noOutput
         }
 
         const output = runtime.captureBuffer.join('\n')
@@ -655,7 +622,7 @@ export function apply(ctx: Context, config: Config) {
       } catch (e) {
         runtime.isCapturing = false
         logger.error(e)
-        return '查询失败: ' + e.message
+        return formatTemplate(config.responses.list.queryFailed, { error: e.message })
       }
     })
 
@@ -663,12 +630,12 @@ export function apply(ctx: Context, config: Config) {
   ctx.command(config.commands.killServer, '强制杀死服务器进程')
     .action(async ({ session }) => {
       // 权限校验
-      if (!checkPermission(session)) return '你没有控制服务器的权限！'
+      if (!checkPermission(session)) return config.responses.common.noControlPermission
 
       // 状态检查
       const mcProcess = runtime.child
       if (!isProcessAlive(mcProcess)) {
-        return '服务器未运行，或者已经似了'
+        return config.responses.common.serverNotRunning
       }
 
       const currentPid = mcProcess.pid
@@ -680,16 +647,16 @@ export function apply(ctx: Context, config: Config) {
         killProcessByRuntime(currentPid, true, (error) => {
           if (error) {
             logger.error(`杀死服务端进程失败: ${error.message}`)
-            session.send(`处决失败！系统返回错误：${error.message}`)
+            session.send(formatTemplate(config.responses.common.killFailed, { error: error.message }))
           } else {
             logger.info(`已执行 ${config.runtime} 进程终止命令，等待进程树清理……`)
-            session.send('处决成功！已清理进程~')
+            session.send(config.responses.killServer.killSuccess)
           }
         })
         return
       } catch (e) {
         logger.error(e)
-        return `处决失败！系统返回错误：${e.message}`
+        return formatTemplate(config.responses.common.killFailed, { error: e.message })
       }
     })
 }
